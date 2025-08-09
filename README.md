@@ -1,1 +1,1 @@
-# v7.2: Content Guides restored. SERP + optional LLM + on-site coverage + per-cluster briefs & FAQ JSON-LD. No prefixing.
+# v7.4: Full feature pack combining v7.2 + v7.3. SERP + LLM + targeted crawl + strong matching + coverage + content guides.

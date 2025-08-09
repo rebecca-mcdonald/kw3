@@ -1,4 +1,4 @@
-# Question Map — v7.2 (No prefixing + Content Guides restored)
+# Question Map — v7.4 (Everything: SERP + LLM + Targeted Crawl + Strong Matching + Coverage + Guides)
 import base64, json, os, re
 from typing import List, Dict, Any, Tuple
 from urllib.parse import urljoin, urlparse
@@ -9,12 +9,13 @@ import streamlit as st
 import pandas as pd
 from pydantic import BaseModel
 
-APP_TITLE = "Question‑First Keyword Map (v7.2: SERP + LLM + Coverage + Content Guides)"
+APP_TITLE = "Question‑First Keyword Map (v7.4: SERP + LLM + Coverage + Guides)"
 DEFAULT_SEEDS = "pricing, installation, warranty, near me, comparison, troubleshooting"
-DEFAULT_MAX_PAGES = 12
+DEFAULT_MAX_PAGES = 30
 CRAWL_TIMEOUT = 10
-UA = "Mozilla/5.0 (compatible; QuestionMapBot/0.4; +https://example.com/bot)"
+UA = "Mozilla/5.0 (compatible; QuestionMapBot/0.6; +https://example.com/bot)"
 
+# ---------- Utils ----------
 def df_to_csv_download(df: pd.DataFrame, filename: str) -> str:
     csv = df.to_csv(index=False).encode("utf-8")
     b64 = base64.b64encode(csv).decode()
@@ -32,12 +33,16 @@ def norm_tokens(s: str) -> List[str]:
     toks = [t for t in toks if t not in STOP and not t.isdigit() and len(t) > 2]
     return toks
 
+def bigrams(toks: List[str]) -> List[str]:
+    return [f"{toks[i]} {toks[i+1]}" for i in range(len(toks)-1)] if len(toks) > 1 else []
+
 def jaccard(a: set, b: set) -> float:
     if not a or not b: return 0.0
     inter = len(a & b)
     union = len(a | b)
     return inter / union if union else 0.0
 
+# ---------- Inputs model ----------
 class AnalyzeRequest(BaseModel):
     project_url: str
     seeds: List[str]
@@ -47,6 +52,10 @@ class AnalyzeRequest(BaseModel):
     serp_api_key: str | None = None
     use_llm: bool = False
     openai_model: str = "gpt-4o-mini"
+    crawl_scope: str = "Homepage + Blog"  # or "Whole site (same domain)"
+
+# ---------- Crawl (targeted or whole-site) ----------
+BLOG_HINTS = ("blog", "news", "insights", "articles", "learn", "resources", "guides")
 
 def same_domain(url: str, base: str) -> bool:
     try:
@@ -55,6 +64,14 @@ def same_domain(url: str, base: str) -> bool:
         return a.netloc.split(":")[0].lower() == b.netloc.split(":")[0].lower() or a.netloc == ""
     except Exception:
         return False
+
+def path_matches_scope(path: str, scope: str) -> bool:
+    if scope == "Whole site (same domain)":
+        return True
+    # Homepage + typical blog paths
+    if path in ("", "/"):
+        return True
+    return any(f"/{hint}/" in (path + "/") for hint in BLOG_HINTS)
 
 def fetch(url: str) -> str:
     try:
@@ -65,26 +82,26 @@ def fetch(url: str) -> str:
         return ""
     return ""
 
-def extract_text_bits(html: str) -> Dict[str, List[str]]:
+def extract_text_bits(html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
-    bits = {"title": [], "h1": [], "h2": [], "h3": [], "meta_desc": [], "text": ""}
+    bits = {"title": "", "h": [], "meta_desc": "", "text": ""}
     t = soup.find("title")
-    if t and t.text: bits["title"].append(clean_text(t.text))
+    if t and t.text: bits["title"] = clean_text(t.text)
     for tag in soup.find_all(["h1","h2","h3"]):
         if tag.text and clean_text(tag.text):
-            bits[tag.name].append(clean_text(tag.text))
+            bits["h"].append(clean_text(tag.text))
     m = soup.find("meta", attrs={"name": "description"})
-    if m and m.get("content"): bits["meta_desc"].append(clean_text(m["content"]))
+    if m and m.get("content"): bits["meta_desc"] = clean_text(m["content"])
     ps = [clean_text(p.get_text(" ")) for p in soup.find_all(["p","li"])]
-    bits["text"] = " ".join(ps)[:20000]
+    bits["text"] = " ".join(ps)[:40000]
     return bits
 
-def crawl_site(start_url: str, max_pages: int = DEFAULT_MAX_PAGES):
+def crawl_site(start_url: str, max_pages: int, scope: str) -> Tuple[List[str], List[Dict[str, Any]]]:
     seen = set()
     queue = [start_url]
-    pages = []
-    bits_all = []
+    pages, bits_all = [], []
     base = start_url
+    base_netloc = urlparse(base).netloc
     while queue and len(pages) < max_pages:
         url = queue.pop(0)
         if url in seen: continue
@@ -97,59 +114,114 @@ def crawl_site(start_url: str, max_pages: int = DEFAULT_MAX_PAGES):
         for a in soup.find_all("a", href=True):
             href = a["href"]
             next_url = urljoin(url, href)
+            u = urlparse(next_url)
             if next_url.startswith(("mailto:", "tel:", "javascript:")): continue
-            if same_domain(next_url, base) and next_url not in seen and len(queue) < max_pages*3:
+            if u.netloc and u.netloc != base_netloc: continue  # same domain only
+            if not path_matches_scope(u.path, scope): continue
+            if next_url not in seen and len(queue) < max_pages*4:
                 queue.append(next_url)
     return pages, bits_all
 
-def top_keywords(pages_bits: List[Dict[str, List[str]]], k: int = 25) -> List[str]:
-    freq = {}
-    for bits in pages_bits:
-        for key in ["title","h1","h2","h3","meta_desc"]:
-            for seg in bits.get(key, []):
-                for w in norm_tokens(seg):
-                    freq[w] = freq.get(w, 0) + 1
-    items = sorted(freq.items(), key=lambda x: x[1], reverse=True)
-    keep = []
-    for w,c in items:
-        if len(keep) >= k: break
-        if w in ("home","products","services","contact","about","menu","shop"): continue
-        keep.append(w)
-    return keep
-
-def build_index(pages, bits_all):
+# ---------- Index + Strong matching ----------
+def build_index(pages: List[str], bits_all: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     index = []
     for url, bits in zip(pages, bits_all):
-        blob = " ".join(bits.get("title", []) + bits.get("h1", []) + bits.get("h2", []) + bits.get("h3", []) + bits.get("meta_desc", [])) + " " + bits.get("text","")
-        tokens = set(norm_tokens(blob))
-        index.append({"url": url, "tokens": tokens, "text": blob})
+        title = bits.get("title", "")
+        headings = " ".join(bits.get("h", []))
+        meta_desc = bits.get("meta_desc", "")
+        body = bits.get("text", "")
+
+        title_tokens = set(norm_tokens(title))
+        head_tokens = set(norm_tokens(headings))
+        meta_tokens = set(norm_tokens(meta_desc))
+        body_tokens = set(norm_tokens(body))
+
+        index.append({
+            "url": url,
+            "title": title,
+            "headings": headings,
+            "meta_desc": meta_desc,
+            "body": body,
+            "title_tokens": title_tokens,
+            "head_tokens": head_tokens,
+            "meta_tokens": meta_tokens,
+            "body_tokens": body_tokens,
+        })
     return index
 
-def best_page_match(question: str, index) -> tuple[str, float, str]:
+def text_contains_bigram(text: str, bigrams_list: List[str]) -> int:
+    t = text.lower()
+    hits = 0
+    for bg in bigrams_list:
+        if bg in t:
+            hits += 1
+    return hits
+
+def best_page_match(question: str, index: List[Dict[str, Any]]) -> Tuple[str, float, str, list]:
     q_norm = clean_text(question).lower().rstrip("?")
     q_tokens = set(norm_tokens(q_norm))
-    best = ("", 0.0, "")
+    q_bigrams = bigrams(list(q_tokens))
+
+    candidates = []
     for doc in index:
-        text_l = doc["text"].lower()
-        exact = 1.0 if q_norm and q_norm in text_l else 0.0
-        overlap = jaccard(q_tokens, doc["tokens"])
-        score = exact*0.6 + overlap*0.4
-        if score > best[1]:
-            pos = text_l.find(q_norm) if exact else -1
-            if pos == -1:
-                positions = [text_l.find(t) for t in q_tokens if text_l.find(t) != -1]
-                pos = min(positions) if positions else 0
-            start = max(0, pos - 80)
-            end = min(len(doc["text"]), pos + 160)
-            snippet = clean_text(doc["text"][start:end])
-            best = (doc["url"], score, snippet)
-    return best
+        title_l = doc["title"].lower()
+        heads_l = doc["headings"].lower()
+        body_l = doc["body"].lower()
+
+        exact_title = 1.0 if q_norm and q_norm in title_l else 0.0
+        exact_head = 1.0 if q_norm and q_norm in heads_l else 0.0
+        exact_body = 1.0 if q_norm and q_norm in body_l else 0.0
+
+        jac_title = jaccard(q_tokens, doc["title_tokens"])
+        jac_head = jaccard(q_tokens, doc["head_tokens"])
+        jac_body = jaccard(q_tokens, doc["body_tokens"])
+
+        bg_title = text_contains_bigram(title_l, q_bigrams)
+        bg_head = text_contains_bigram(heads_l, q_bigrams)
+        bg_body = text_contains_bigram(body_l, q_bigrams)
+        bg_norm = min(1.0, (bg_title*1.0 + bg_head*0.7 + bg_body*0.4) / 3.0)
+
+        score = (
+            0.30*exact_title + 0.20*exact_head + 0.10*exact_body +
+            0.12*jac_title + 0.14*jac_head + 0.10*jac_body +
+            0.04*bg_norm
+        )
+
+        snippet = ""
+        if exact_title:
+            snippet = doc["title"]
+        elif exact_head:
+            snippet = doc["headings"][:220]
+        else:
+            body = doc["body"]
+            pos = -1
+            for t in q_tokens:
+                i = body.lower().find(t)
+                if i != -1 and (pos == -1 or i < pos):
+                    pos = i
+            if pos != -1:
+                start = max(0, pos - 80)
+                end = min(len(body), pos + 220)
+                snippet = clean_text(body[start:end])
+            else:
+                snippet = clean_text(body[:220])
+
+        candidates.append((doc["url"], score, snippet))
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    if not candidates:
+        return ("", 0.0, "", [])
+
+    best_url, best_score, best_snippet = candidates[0]
+    top = candidates[:5]
+    return (best_url, best_score, best_snippet, top)
 
 def coverage_label(score: float) -> str:
-    if score >= 0.65: return "Yes"
-    if score >= 0.40: return "Partial"
+    if score >= 0.60: return "Yes"
+    if score >= 0.35: return "Partial"
     return "No"
 
+# ---------- SERP / LLM (no prefixing) ----------
 def serpapi_related(seed: str, api_key: str, location: str = "United States") -> Dict[str, List[str]]:
     out = {"paa": [], "related": [], "suggestions": []}
     try:
@@ -187,7 +259,7 @@ def expand_with_serp(seed: str, provider: str, api_key: str | None, geography: s
             if k not in seen:
                 out.append(q)
                 seen.add(k)
-        return out[:60]
+        return out[:70]
     return []
 
 def llm_expand(seed: str, topics: List[str], model: str = "gpt-4o-mini") -> List[str]:
@@ -225,6 +297,7 @@ def llm_expand(seed: str, topics: List[str], model: str = "gpt-4o-mini") -> List
     except Exception:
         return []
 
+# ---------- Scoring / Labels ----------
 def estimate_bands(question: str) -> tuple[str, str]:
     q = question.lower()
     if any(k in q for k in ["best", " vs", "price", "cost", "near me"]):
@@ -271,16 +344,18 @@ def compute_os(volume_band: str, difficulty_band: str, geography: str = "US", si
     oscore = 0.25*vol_w + 0.15*diff_w + 0.20*sitegap + 0.10*geo_w + 0.20*business_value + 0.10*serp_potential
     return round(float(oscore), 3)
 
+# ---------- UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("SERP (PAA/autocomplete/related) + optional LLM + on-site coverage + Content Guides (briefs + FAQ JSON-LD). No SERP prefixing.")
+st.caption("Everything in one: SERP (no prefix), optional LLM, targeted crawl, strong matching, coverage, and content guides.")
 
 with st.sidebar:
     st.header("Inputs")
     url = st.text_input("Client URL (any site)", placeholder="https://example.com")
     seeds_text = st.text_area("Seed keywords (comma or newline)", value=DEFAULT_SEEDS, height=110)
     geography = st.selectbox("Target geography", ["US", "CA", "Global"], index=0)
-    max_pages = st.number_input("Max pages to crawl (same domain)", min_value=3, max_value=50, value=DEFAULT_MAX_PAGES, step=1)
+    crawl_scope = st.selectbox("Crawl scope", ["Homepage + Blog", "Whole site (same domain)"], index=0)
+    max_pages = st.number_input("Max pages to crawl (cap)", min_value=5, max_value=120, value=DEFAULT_MAX_PAGES, step=1)
     st.divider()
     st.subheader("SERP Expansion")
     provider = st.selectbox("Provider", ["serpapi", "none"], index=0)
@@ -298,19 +373,20 @@ if run_btn:
     serp_key = api_key or os.environ.get("SERP_API_KEY") or st.secrets.get("SERP_API_KEY", None)
     req = AnalyzeRequest(project_url=url or "https://example.com", seeds=seeds, geography=geography,
                          max_pages=int(max_pages), serp_provider=provider, serp_api_key=serp_key,
-                         use_llm=use_llm, openai_model=llm_model)
+                         use_llm=use_llm, openai_model=llm_model, crawl_scope=crawl_scope)
 
     # Crawl + index
-    with st.status("Crawling and indexing site…", expanded=False):
-        pages, bits_all = crawl_site(req.project_url, max_pages=req.max_pages)
-        topics = top_keywords(bits_all, k=25) if bits_all else []
+    with st.status("Crawling (targeted) and indexing…", expanded=False):
+        pages, bits_all = crawl_site(req.project_url, max_pages=req.max_pages, scope=req.crawl_scope)
         index = build_index(pages, bits_all) if pages else []
-        st.write(f"Crawled {len(pages)} page(s).")
-        if topics:
-            st.write("Top topics:", ", ".join(topics[:12]))
+        st.write(f"Crawled {len(pages)} page(s). Scope: {req.crawl_scope}")
+        if pages:
+            st.write("Sample URLs:", pages[:5])
 
     # Build questions
     rows = []
+    all_questions = []
+    topics = []  # not needed for functionality; could be used for LLM prompt later
     for seed in req.seeds:
         qset = []
         serp_qs = expand_with_serp(seed, req.serp_provider, req.serp_api_key, req.geography)
@@ -325,35 +401,44 @@ if run_btn:
                 f"{seed} vs alternatives—what’s the difference?",
                 f"Common problems with {seed} and how to fix them"
             ]
+        all_questions.extend(qset)
 
-        for q in qset:
-            qn = clean_text(q)
-            vol_band, diff_band = estimate_bands(qn)
-            page_type = rules_page_type(qn)
-            intent = rules_intent(qn)
-            oscore = compute_os(vol_band, diff_band, geography=req.geography, serp_potential=0.9 if serp_qs else 0.5)
+    # Deduplicate questions
+    uniq_qs = []
+    seen = set()
+    for q in [clean_text(x) for x in all_questions if clean_text(x)]:
+        k = q.lower()
+        if k not in seen:
+            uniq_qs.append(q)
+            seen.add(k)
 
-            best_url, match_score, snippet = best_page_match(qn, index) if index else ("", 0.0, "")
-            cov = coverage_label(match_score)
+    # Score + coverage
+    for qn in uniq_qs:
+        vol_band, diff_band = estimate_bands(qn)
+        page_type = rules_page_type(qn)
+        intent = rules_intent(qn)
+        oscore = compute_os(vol_band, diff_band, geography=req.geography, serp_potential=0.9 if req.serp_api_key else 0.5)
 
-            rows.append({
-                "Seed": seed,
-                "Question": qn if qn.endswith("?") else (qn + "?"),
-                "Intent": intent,
-                "Volume Band (proxy)": vol_band,
-                "Difficulty Band (proxy)": diff_band,
-                "Recommended Page Type": page_type,
-                "On‑Site Coverage": cov,
-                "Match Score": round(match_score, 3),
-                "Best Match URL": best_url,
-                "Snippet": snippet,
-                "Opportunity Score": oscore,
-                "Cluster Label": label_cluster(qn),
-                "Source": ("SERP" if q in serp_qs else ("LLM" if req.use_llm else "Fallback"))
-            })
+        best_url, match_score, snippet, _ = best_page_match(qn, index) if index else ("", 0.0, "", [])
+        cov = coverage_label(match_score)
+
+        rows.append({
+            "Question": qn if qn.endswith("?") else (qn + "?"),
+            "Intent": intent,
+            "Volume Band (proxy)": vol_band,
+            "Difficulty Band (proxy)": diff_band,
+            "Recommended Page Type": page_type,
+            "On‑Site Coverage": cov,
+            "Match Score": round(match_score, 3),
+            "Best Match URL": best_url,
+            "Snippet": snippet,
+            "Opportunity Score": oscore,
+            "Cluster Label": label_cluster(qn),
+            "Source": "SERP/LLM"
+        })
 
     df = pd.DataFrame(rows, columns=[
-        "Seed","Question","Intent","Volume Band (proxy)","Difficulty Band (proxy)",
+        "Question","Intent","Volume Band (proxy)","Difficulty Band (proxy)",
         "Recommended Page Type","On‑Site Coverage","Match Score","Best Match URL","Snippet",
         "Opportunity Score","Cluster Label","Source"
     ])
@@ -367,8 +452,20 @@ if run_btn:
     st.subheader("Questions + Coverage")
     st.dataframe(df.sort_values(["On‑Site Coverage","Opportunity Score"], ascending=[True, False]), use_container_width=True)
 
-    # ---------- Content Guides (restored) ----------
-    st.subheader("Content Guides (auto-briefs per cluster, focuses on gaps)")
+    # Coverage debug
+    st.subheader("Coverage Debug")
+    q_choice = st.selectbox("Pick a question to inspect", df["Question"].tolist())
+    if q_choice and index:
+        from itertools import islice
+        best_url, best_score, best_snippet, top = best_page_match(q_choice, index)
+        st.write("Top matches:")
+        for (u,snip_score,snip) in islice(top, 5):
+            st.markdown(f"- **{u}** — score: `{snip_score:.3f}`")
+        st.write("Best snippet:")
+        st.write(best_snippet)
+
+    # Content Guides (per cluster)
+    st.subheader("Content Guides (auto-briefs per cluster, focus on gaps)")
     def build_brief(cluster_label: str, questions: List[str], page_type: str, url_slug: str) -> str:
         h2 = [
             "What it is / why it matters",
@@ -393,7 +490,6 @@ if run_btn:
 
     briefs = []
     for label in sorted(df["Cluster Label"].unique()):
-        # prioritize uncovered questions in the brief
         subset = df[(df["Cluster Label"] == label) & (df["On‑Site Coverage"] != "Yes")].sort_values("Opportunity Score", ascending=False)
         top_qs = subset["Question"].tolist() or df[df["Cluster Label"] == label]["Question"].tolist()
         page_type = subset["Recommended Page Type"].mode().iloc[0] if not subset.empty else df[df["Cluster Label"] == label]["Recommended Page Type"].mode().iloc[0]
@@ -414,9 +510,9 @@ if run_btn:
 
     # Export
     st.subheader("Export")
-    st.markdown(df_to_csv_download(df, "question_map_v7_2.csv"), unsafe_allow_html=True)
-    all_md = "\n\n".join([b[1] for b in briefs])
-    st.download_button("Download Content Guides (Markdown)", data=all_md.encode("utf-8"), file_name="content_guides.md", mime="text/markdown")
+    st.markdown(df_to_csv_download(df, "question_map_v7_4.csv"), unsafe_allow_html=True)
+    all_md = "\n\n".join([b[1] for b in briefs]) if briefs else ""
+    st.download_button("Download Content Guides (Markdown)", data=all_md.encode("utf-8"), file_name="content_guides_v7_4.md", mime="text/markdown")
 
     # Summary
     st.subheader("Summary")
@@ -429,4 +525,4 @@ if run_btn:
     })
 
 else:
-    st.info("Paste a site URL + seeds. App pulls SERP (no prefixing), optional LLM, audits on-site coverage, and generates Content Guides + FAQ JSON-LD per cluster.")
+    st.info("Paste a site URL + seeds. This build keeps SERP (no prefix), optional LLM, targeted crawl, strong matching, coverage, and content guides.")

@@ -1,4 +1,4 @@
-# Question Map (Universal, SERP-powered, Coverage) — v6b (full)
+# Question Map — v7 (Universal + SERP + LLM + Coverage)
 import base64, json, os, re
 from typing import List, Dict, Any, Tuple
 from urllib.parse import urljoin, urlparse
@@ -9,12 +9,13 @@ import streamlit as st
 import pandas as pd
 from pydantic import BaseModel
 
-APP_TITLE = "Question‑First Keyword Map (SERP + Coverage v6b)"
+APP_TITLE = "Question‑First Keyword Map (v7: SERP + LLM + Coverage)"
 DEFAULT_SEEDS = "pricing, installation, warranty, near me, comparison, troubleshooting"
 DEFAULT_MAX_PAGES = 12
 CRAWL_TIMEOUT = 10
-UA = "Mozilla/5.0 (compatible; QuestionMapBot/0.3; +https://example.com/bot)"
+UA = "Mozilla/5.0 (compatible; QuestionMapBot/0.4; +https://example.com/bot)"
 
+# ---------- Utils ----------
 def df_to_csv_download(df: pd.DataFrame, filename: str) -> str:
     csv = df.to_csv(index=False).encode("utf-8")
     b64 = base64.b64encode(csv).decode()
@@ -38,16 +39,18 @@ def jaccard(a: set, b: set) -> float:
     union = len(a | b)
     return inter / union if union else 0.0
 
+# ---------- Inputs model ----------
 class AnalyzeRequest(BaseModel):
     project_url: str
     seeds: List[str]
     geography: str = "US"
     max_pages: int = DEFAULT_MAX_PAGES
-    serp_provider: str = "serpapi"
+    serp_provider: str = "serpapi"  # or "none"
     serp_api_key: str | None = None
     use_llm: bool = False
     openai_model: str = "gpt-4o-mini"
 
+# ---------- Crawl + index ----------
 def same_domain(url: str, base: str) -> bool:
     try:
         a = urlparse(url)
@@ -79,7 +82,7 @@ def extract_text_bits(html: str) -> Dict[str, List[str]]:
     bits["text"] = " ".join(ps)[:20000]
     return bits
 
-def crawl_site(start_url: str, max_pages: int = DEFAULT_MAX_PAGES):
+def crawl_site(start_url: str, max_pages: int = DEFAULT_MAX_PAGES) -> Tuple[List[str], List[Dict[str, List[str]]]]:
     seen = set()
     queue = [start_url]
     pages = []
@@ -137,7 +140,6 @@ def best_page_match(question: str, index) -> tuple[str, float, str]:
         if score > best[1]:
             pos = text_l.find(q_norm) if exact else -1
             if pos == -1:
-                # find any token position
                 positions = [text_l.find(t) for t in q_tokens if text_l.find(t) != -1]
                 pos = min(positions) if positions else 0
             start = max(0, pos - 80)
@@ -151,6 +153,7 @@ def coverage_label(score: float) -> str:
     if score >= 0.40: return "Partial"
     return "No"
 
+# ---------- SERP (SerpAPI) ----------
 def serpapi_related(seed: str, api_key: str, location: str = "United States") -> Dict[str, List[str]]:
     out = {"paa": [], "related": [], "suggestions": []}
     try:
@@ -197,6 +200,45 @@ def expand_with_serp(seed: str, provider: str, api_key: str | None, geography: s
         return out[:60]
     return []
 
+# ---------- LLM Expansion (optional) ----------
+def llm_expand(seed: str, topics: List[str], model: str = "gpt-4o-mini") -> List[str]:
+    # Only run if OPENAI_API_KEY exists
+    api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
+    if not api_key:
+        return []
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        prompt = (
+            "Generate 25 searcher-style questions (short, natural US phrasing) about '{seed}'. "
+            "Blend commercial and informational intent. Prioritize high-impact topics users actually search. "
+            "Include cost/pricing, comparisons, near-me, how-to, troubleshooting. "
+            "Bias toward these site topics when relevant: " + ", ".join(topics[:10])
+        ).format(seed=seed)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.2,
+            max_tokens=800,
+        )
+        text = resp.choices[0].message.content
+        lines = [clean_text(x) for x in text.split("\n") if clean_text(x)]
+        out = []
+        for ln in lines:
+            ln = re.sub(r"^\d+[\).\s-]+", "", ln)
+            if not ln.endswith("?"):
+                ln = ln.rstrip(".") + "?"
+            out.append(ln)
+        seen, uniq = set(), []
+        for q in out:
+            if q.lower() not in seen:
+                uniq.append(q)
+                seen.add(q.lower())
+        return uniq[:40]
+    except Exception:
+        return []
+
+# ---------- Scoring / Labels ----------
 def estimate_bands(question: str) -> tuple[str, str]:
     q = question.lower()
     if any(k in q for k in ["best", " vs", "price", "cost", "near me"]):
@@ -243,9 +285,10 @@ def compute_os(volume_band: str, difficulty_band: str, geography: str = "US", si
     oscore = 0.25*vol_w + 0.15*diff_w + 0.20*sitegap + 0.10*geo_w + 0.20*business_value + 0.10*serp_potential
     return round(float(oscore), 3)
 
+# ---------- UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("SERP-powered questions (PAA/autocomplete/related) + on-site coverage audit (URL + snippet).")
+st.caption("SERP (PAA/autocomplete/related) + optional LLM + on-site coverage (best URL + snippet). Pure-Python & deployable.")
 
 with st.sidebar:
     st.header("Inputs")
@@ -257,6 +300,9 @@ with st.sidebar:
     st.subheader("SERP Expansion")
     provider = st.selectbox("Provider", ["serpapi", "none"], index=0)
     api_key = st.text_input("SERP API key (or set SERP_API_KEY env/secret)", type="password")
+    st.subheader("LLM Expansion")
+    use_llm = st.toggle("Use LLM (OpenAI)", value=False)
+    llm_model = st.text_input("OpenAI model", value="gpt-4o-mini")
     run_btn = st.button("Run Analysis", type="primary")
 
 if run_btn:
@@ -266,7 +312,8 @@ if run_btn:
         st.stop()
     serp_key = api_key or os.environ.get("SERP_API_KEY") or st.secrets.get("SERP_API_KEY", None)
     req = AnalyzeRequest(project_url=url or "https://example.com", seeds=seeds, geography=geography,
-                         max_pages=int(max_pages), serp_provider=provider, serp_api_key=serp_key)
+                         max_pages=int(max_pages), serp_provider=provider, serp_api_key=serp_key,
+                         use_llm=use_llm, openai_model=llm_model)
 
     # Crawl + index
     with st.status("Crawling and indexing site…", expanded=False):
@@ -280,9 +327,13 @@ if run_btn:
     # Build questions
     rows = []
     for seed in req.seeds:
-        qset = expand_with_serp(seed, req.serp_provider, req.serp_api_key, req.geography)
+        qset = []
+        serp_qs = expand_with_serp(seed, req.serp_provider, req.serp_api_key, req.geography)
+        qset += serp_qs
+        if req.use_llm:
+            qset += llm_expand(seed, topics, model=req.openai_model)
         if not qset:
-            # fallback small set
+            # fallback
             qset = [
                 f"What is {seed} and how does it work?",
                 f"How to choose {seed}?",
@@ -296,7 +347,7 @@ if run_btn:
             vol_band, diff_band = estimate_bands(qn)
             page_type = rules_page_type(qn)
             intent = rules_intent(qn)
-            oscore = compute_os(vol_band, diff_band, geography=req.geography, serp_potential=0.9 if req.serp_api_key else 0.5)
+            oscore = compute_os(vol_band, diff_band, geography=req.geography, serp_potential=0.9 if serp_qs else 0.5)
 
             best_url, match_score, snippet = best_page_match(qn, index) if index else ("", 0.0, "")
             cov = coverage_label(match_score)
@@ -314,7 +365,7 @@ if run_btn:
                 "Snippet": snippet,
                 "Opportunity Score": oscore,
                 "Cluster Label": label_cluster(qn),
-                "Source": "SERP" if req.serp_api_key else "Fallback"
+                "Source": ("SERP" if q in serp_qs else ("LLM" if req.use_llm else "Fallback"))
             })
 
     df = pd.DataFrame(rows, columns=[
@@ -324,7 +375,7 @@ if run_btn:
     ])
 
     if df.empty:
-        st.error("No questions generated. Check your SERP API key.")
+        st.error("No questions generated. Check your SERP API key or enable LLM fallback.")
         st.stop()
 
     st.success("Analysis complete")
@@ -332,15 +383,65 @@ if run_btn:
     st.subheader("Questions + Coverage")
     st.dataframe(df.sort_values(["On‑Site Coverage","Opportunity Score"], ascending=[True, False]), use_container_width=True)
 
-    st.subheader("Export")
-    st.markdown(df_to_csv_download(df, "question_map_serp_coverage.csv"), unsafe_allow_html=True)
+    # Briefs / FAQ
+    st.subheader("Content Briefs (focus gaps)")
+    def build_brief(cluster_label: str, questions: List[str], page_type: str, url_slug: str) -> str:
+        h2 = [
+            "What it is / why it matters",
+            "Specs to compare / decision criteria",
+            "How to choose (use‑case)",
+            "Compliance / policies / warranties",
+            "Troubleshooting or implementation notes",
+            "Recommended products/services",
+            "FAQ",
+        ]
+        md = [
+            f"# Content Brief: {cluster_label}",
+            f"**Page Type:** {page_type}",
+            f"**Proposed URL:** {url_slug}",
+            "\n**Primary Questions**",
+        ]
+        md += [f"- {q}" for q in questions[:8]]
+        md += ["\n## Outline (H2/H3)"] + [f"- {x}" for x in h2]
+        md += ["\n## Internal Links\n- Category / services\n- Pricing / Contact / Quote\n- Shipping / Warranty / Policies"]
+        md += ["\n## CTA\n- Get a quote\n- Request a demo / consult"]
+        return "\n".join(md)
 
+    briefs = []
+    for label in sorted(df["Cluster Label"].unique()):
+        subset = df[(df["Cluster Label"] == label) & (df["On‑Site Coverage"] != "Yes")].sort_values("Opportunity Score", ascending=False)
+        top_qs = subset["Question"].tolist() or df[df["Cluster Label"] == label]["Question"].tolist()
+        page_type = subset["Recommended Page Type"].mode().iloc[0] if not subset.empty else df[df["Cluster Label"] == label]["Recommended Page Type"].mode().iloc[0]
+        slug_token = label.replace(" ", "-")
+        brief_md = build_brief(label, top_qs, page_type, f"/resources/{slug_token}-guide")
+        briefs.append((label, brief_md, top_qs[:6]))
+
+    for label, md, top_qs in briefs:
+        with st.expander(f"Brief: {label} — focus on gaps"):
+            st.markdown(md)
+            faq_entities = [{
+                "@type": "Question",
+                "name": q,
+                "acceptedAnswer": {"@type": "Answer", "text": "Short, helpful answer (90–160 words)."}
+            } for q in top_qs]
+            faq_json = {"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": faq_entities}
+            st.code(json.dumps(faq_json, indent=2), language="json")
+
+    # Export
+    st.subheader("Export")
+    st.markdown(df_to_csv_download(df, "question_map_v7.csv"), unsafe_allow_html=True)
+    all_md = "\n\n".join([b[1] for b in briefs])
+    st.download_button("Download Briefs (Markdown)", data=all_md.encode("utf-8"), file_name="briefs.md", mime="text/markdown")
+
+    # Summary
     st.subheader("Summary")
     st.write({
-        "Crawled pages": int(len(set(df["Best Match URL"]) - {""})),
+        "Crawled pages": int(len(pages)),
         "Clusters": int(df["Cluster Label"].nunique()),
         "SERP used": req.serp_provider if req.serp_provider != "none" and req.serp_api_key else "No",
+        "LLM used": req.use_llm,
         "Gaps (No/Partial)": int((df["On‑Site Coverage"] != "Yes").sum())
     })
+
 else:
-    st.info("Enter a site URL + seeds. The app uses SERP questions (PAA/autocomplete/related) and checks if your site already answers them (URL + snippet).")
+    st.info("Enter a site URL + seeds. Toggle SERP/LLM in the sidebar. The app crawls, generates questions, and checks on-site coverage with best-match URL + snippet.")

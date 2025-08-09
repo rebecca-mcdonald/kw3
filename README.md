@@ -1,1 +1,1 @@
-# v7.5: Diagnostics build — safer fetch, manual blog roots, token-count table, and explicit warnings when the index is empty.
+# v7.6: SERP + LLM + targeted crawl + strong matching + coverage + content guides + diagnostics (token counts & crawl log hints).

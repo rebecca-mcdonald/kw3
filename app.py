@@ -1,4 +1,4 @@
-# Question Map — v7.5 (diagnostics + safer fetch + manual blog roots)
+# Question Map — v7.6 (Full features + diagnostics)
 import base64, json, os, re
 from typing import List, Dict, Any, Tuple
 from urllib.parse import urljoin, urlparse
@@ -9,11 +9,11 @@ import streamlit as st
 import pandas as pd
 from pydantic import BaseModel
 
-APP_TITLE = "Question‑First Keyword Map (v7.5: diagnostics + safer fetch + targeted crawl)"
+APP_TITLE = "Question‑First Keyword Map (v7.6: SERP + LLM + Coverage + Guides + Diagnostics)"
 DEFAULT_SEEDS = "pricing, installation, warranty, near me, comparison, troubleshooting"
-DEFAULT_MAX_PAGES = 40
+DEFAULT_MAX_PAGES = 60
 CRAWL_TIMEOUT = 15
-UA = "Mozilla/5.0 (compatible; QuestionMapBot/0.7; +https://example.com/bot)"
+UA = "Mozilla/5.0 (compatible; QuestionMapBot/0.8; +https://example.com/bot)"
 
 def df_to_csv_download(df: pd.DataFrame, filename: str) -> str:
     csv = df.to_csv(index=False).encode("utf-8")
@@ -55,14 +55,6 @@ class AnalyzeRequest(BaseModel):
 
 BLOG_HINTS = ("blog", "news", "insights", "articles", "learn", "resources", "guides", "knowledge", "academy")
 
-def same_domain(url: str, base: str) -> bool:
-    try:
-        a = urlparse(url)
-        b = urlparse(base)
-        return a.netloc.split(':')[0].lower() == b.netloc.split(':')[0].lower() or a.netloc == ""
-    except Exception:
-        return False
-
 def path_matches_scope(path: str, scope: str, extra_roots: List[str]) -> bool:
     if scope == "Whole site (same domain)":
         return True
@@ -78,11 +70,10 @@ def fetch(url: str) -> tuple[str, int, str]:
     try:
         resp = requests.get(url, headers={"User-Agent": UA}, timeout=CRAWL_TIMEOUT, allow_redirects=True)
         ctype = resp.headers.get("Content-Type", "").lower()
-        # accept text/html or unknown types (some servers omit it)
         if resp.status_code == 200 and ("text/html" in ctype or ctype == "" or "charset" in ctype):
             return resp.text, resp.status_code, ctype
         return "", resp.status_code, ctype
-    except Exception as e:
+    except Exception:
         return "", 0, ""
 
 def extract_text_bits(html: str) -> Dict[str, Any]:
@@ -98,7 +89,7 @@ def extract_text_bits(html: str) -> Dict[str, Any]:
     og = soup.find("meta", property="og:description")
     if og and og.get("content"): bits["og_desc"] = clean_text(og["content"])
     ps = [clean_text(p.get_text(" ")) for p in soup.find_all(["p","li"])]
-    bits["text"] = " ".join(ps)[:50000]
+    bits["text"] = " ".join(ps)[:60000]
     return bits
 
 def crawl_site(start_url: str, max_pages: int, scope: str, extra_roots: List[str]):
@@ -135,12 +126,6 @@ def build_index(pages: List[str], bits_all: List[Dict[str, Any]]):
         meta_desc = bits.get("meta_desc", "")
         og_desc = bits.get("og_desc", "")
         body = bits.get("text", "")
-
-        title_tokens = set(norm_tokens(title))
-        head_tokens = set(norm_tokens(headings))
-        meta_tokens = set(norm_tokens(meta_desc + " " + og_desc))
-        body_tokens = set(norm_tokens(body))
-
         index.append({
             "url": url,
             "title": title,
@@ -148,10 +133,10 @@ def build_index(pages: List[str], bits_all: List[Dict[str, Any]]):
             "meta_desc": meta_desc,
             "og_desc": og_desc,
             "body": body,
-            "title_tokens": title_tokens,
-            "head_tokens": head_tokens,
-            "meta_tokens": meta_tokens,
-            "body_tokens": body_tokens,
+            "title_tokens": set(norm_tokens(title)),
+            "head_tokens": set(norm_tokens(headings)),
+            "meta_tokens": set(norm_tokens(meta_desc + " " + og_desc)),
+            "body_tokens": set(norm_tokens(body)),
         })
     return index
 
@@ -159,12 +144,25 @@ def text_contains_bigram(text: str, bigrams_list: List[str]) -> int:
     t = text.lower()
     return sum(1 for bg in bigrams_list if bg in t)
 
+def jaccard(a: set, b: set) -> float:
+    if not a or not b: return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+def norm_tokens(s: str) -> List[str]:
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s\-]", " ", s)
+    toks = [t for t in re.split(r"\s+", s) if t]
+    toks = [t for t in toks if t not in STOP and not t.isdigit() and len(t) > 2]
+    return toks
+
 def best_page_match(question: str, index: List[Dict[str, Any]]):
+    def bigrams(toks: List[str]) -> List[str]:
+        return [f"{toks[i]} {toks[i+1]}" for i in range(len(toks)-1)] if len(toks) > 1 else []
+
     q_norm = clean_text(question).lower().rstrip("?")
-    q_tokens = set(norm_tokens(q_norm))
-    if not q_tokens:
-        # if tokens strip out (e.g., very short terms), keep letters/numbers tokens
-        q_tokens = set([t for t in re.findall(r"[a-z0-9]+", q_norm) if len(t) >= 2])
+    q_tokens = set(norm_tokens(q_norm)) or set(re.findall(r"[a-z0-9]+", q_norm))
     q_bigrams = bigrams(list(q_tokens))
 
     candidates = []
@@ -179,10 +177,10 @@ def best_page_match(question: str, index: List[Dict[str, Any]]):
         exact_meta  = 1.0 if q_norm and q_norm in meta_l else 0.0
         exact_body  = 1.0 if q_norm and q_norm in body_l else 0.0
 
-        jac_title = jaccard(q_tokens, doc["title_tokens"] if "title_tokens" in doc else set(norm_tokens(doc["title"])))
-        jac_head  = jaccard(q_tokens, doc["head_tokens"]  if "head_tokens"  in doc else set(norm_tokens(doc["headings"])))
-        jac_meta  = jaccard(q_tokens, doc["meta_tokens"]  if "meta_tokens"  in doc else set(norm_tokens(meta_l)))
-        jac_body  = jaccard(q_tokens, doc["body_tokens"]  if "body_tokens"  in doc else set(norm_tokens(doc["body"])))
+        jac_title = jaccard(q_tokens, doc["title_tokens"])
+        jac_head  = jaccard(q_tokens, doc["head_tokens"])
+        jac_meta  = jaccard(q_tokens, doc["meta_tokens"])
+        jac_body  = jaccard(q_tokens, doc["body_tokens"])
 
         bg_title = text_contains_bigram(title_l, q_bigrams)
         bg_head  = text_contains_bigram(heads_l, q_bigrams)
@@ -195,7 +193,7 @@ def best_page_match(question: str, index: List[Dict[str, Any]]):
             0.06*bg_norm
         )
 
-        # snippet: prefer title/headings/meta, else body window around first token
+        # snippet
         snippet = ""
         if exact_title: snippet = doc["title"]
         elif exact_head: snippet = doc["headings"][:220]
@@ -225,7 +223,6 @@ def coverage_label(score: float) -> str:
     if score >= 0.33: return "Partial"
     return "No"
 
-# SERP / LLM (no prefixing)
 def serpapi_related(seed: str, api_key: str, location: str = "United States") -> Dict[str, List[str]]:
     out = {"paa": [], "related": [], "suggestions": []}
     try:
@@ -348,7 +345,7 @@ def compute_os(volume_band: str, difficulty_band: str, geography: str = "US", si
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Diagnostics-first build: better crawl acceptance, manual blog roots, stronger matching, and clear coverage warnings.")
+st.caption("Full feature pack + diagnostics: coverage that actually fills, guides, and visibility into crawl/indexing.")
 
 with st.sidebar:
     st.header("Inputs")
@@ -357,7 +354,7 @@ with st.sidebar:
     geography = st.selectbox("Target geography", ["US", "CA", "Global"], index=0)
     crawl_scope = st.selectbox("Crawl scope", ["Homepage + Blog", "Whole site (same domain)"], index=0)
     extra_roots_text = st.text_input("Extra blog roots (comma-separated, e.g. knowledge, academy)")
-    max_pages = st.number_input("Max pages to crawl (cap)", min_value=5, max_value=160, value=DEFAULT_MAX_PAGES, step=1)
+    max_pages = st.number_input("Max pages to crawl (cap)", min_value=5, max_value=200, value=DEFAULT_MAX_PAGES, step=1)
     st.divider()
     st.subheader("SERP Expansion")
     provider = st.selectbox("Provider", ["serpapi", "none"], index=0)
@@ -378,6 +375,7 @@ if run_btn:
                          max_pages=int(max_pages), serp_provider=provider, serp_api_key=serp_key,
                          use_llm=use_llm, openai_model=llm_model, crawl_scope=crawl_scope, extra_roots=extra_roots)
 
+    # Crawl + index + diagnostics
     with st.status("Crawling and indexing…", expanded=True):
         pages, bits_all, crawl_log = crawl_site(req.project_url, max_pages=req.max_pages, scope=req.crawl_scope, extra_roots=req.extra_roots)
         index = build_index(pages, bits_all) if pages else []
@@ -388,10 +386,9 @@ if run_btn:
         if pages:
             st.write("Sample URLs:", pages[:8])
 
-    # If index empty, warn and bail early with guidance
     if not index:
         st.error("No crawlable HTML pages were indexed.")
-        st.info("Try: (1) ensure the URL includes https://, (2) switch crawl scope to 'Whole site', (3) add custom blog roots (e.g., 'knowledge'), (4) increase Max pages.")
+        st.info("Try: (1) ensure URL includes https://, (2) switch scope to 'Whole site', (3) add custom blog roots, (4) increase Max pages.")
         st.stop()
 
     # Build questions
@@ -453,10 +450,10 @@ if run_btn:
     st.subheader("Questions + Coverage")
     st.dataframe(df.sort_values(["On‑Site Coverage","Opportunity Score"], ascending=[True, False]), use_container_width=True)
 
-    # Coverage diagnostics table
+    # Coverage diagnostics (token counts)
     st.subheader("Coverage diagnostics")
     diag = []
-    for idx, row in enumerate(index):
+    for row in index:
         diag.append({
             "URL": row["url"],
             "Title tokens": len(row["title_tokens"]),
@@ -465,12 +462,57 @@ if run_btn:
             "Body tokens": len(row["body_tokens"]),
             "Title": row["title"][:120],
         })
-    diag_df = pd.DataFrame(diag)
-    st.dataframe(diag_df, use_container_width=True)
+    st.dataframe(pd.DataFrame(diag), use_container_width=True)
+
+    # Content Guides (per cluster, focus on gaps)
+    st.subheader("Content Guides (auto-briefs per cluster, focus on gaps)")
+    def build_brief(cluster_label: str, questions: List[str], page_type: str, url_slug: str) -> str:
+        h2 = [
+            "What it is / why it matters",
+            "Specs to compare / decision criteria",
+            "How to choose (use‑case)",
+            "Compliance / policies / warranties",
+            "Troubleshooting or implementation notes",
+            "Recommended products/services",
+            "FAQ",
+        ]
+        md = [
+            f"# Content Guide: {cluster_label}",
+            f"**Page Type:** {page_type}",
+            f"**Proposed URL:** {url_slug}",
+            "\n**Primary Questions to Answer**",
+        ]
+        md += [f"- {q}" for q in questions[:8]]
+        md += ["\n## Outline (H2/H3)"] + [f"- {x}" for x in h2]
+        md += ["\n## Internal Links\n- Category / services\n- Pricing / Contact / Quote\n- Shipping / Warranty / Policies"]
+        md += ["\n## CTA\n- Get a quote\n- Request a demo / consult"]
+        return "\n".join(md)
+
+    briefs = []
+    for label in sorted(df["Cluster Label"].unique()):
+        subset = df[(df["Cluster Label"] == label) & (df["On‑Site Coverage"] != "Yes")].sort_values("Opportunity Score", ascending=False)
+        top_qs = subset["Question"].tolist() or df[df["Cluster Label"] == label]["Question"].tolist()
+        page_type = subset["Recommended Page Type"].mode().iloc[0] if not subset.empty else df[df["Cluster Label"] == label]["Recommended Page Type"].mode().iloc[0]
+        slug_token = label.replace(" ", "-")
+        brief_md = build_brief(label, top_qs, page_type, f"/resources/{slug_token}-guide")
+        briefs.append((label, brief_md, top_qs[:6]))
+
+    for label, md, top_qs in briefs:
+        with st.expander(f"Guide: {label} — focus on gaps"):
+            st.markdown(md)
+            faq_entities = [{
+                "@type": "Question",
+                "name": q,
+                "acceptedAnswer": {"@type": "Answer", "text": "Short, helpful answer (90–160 words)."}
+            } for q in top_qs]
+            faq_json = {"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": faq_entities}
+            st.code(json.dumps(faq_json, indent=2), language="json")
 
     # Export
     st.subheader("Export")
-    st.markdown(df_to_csv_download(df, "question_map_v7_5.csv"), unsafe_allow_html=True)
+    st.markdown(df_to_csv_download(df, "question_map_v7_6.csv"), unsafe_allow_html=True)
+    all_md = "\n\n".join([b[1] for b in briefs]) if briefs else ""
+    st.download_button("Download Content Guides (Markdown)", data=all_md.encode("utf-8"), file_name="content_guides_v7_6.md", mime="text/markdown")
 
 else:
-    st.info("Use 'Homepage + Blog' scope or add custom blog roots (e.g., knowledge). This build shows crawl/HTML acceptance, token counts, and warns if the index is empty.")
+    st.info("Paste a site URL + seeds. v7.6 merges targeted crawl, strong matching, diagnostics, and Content Guides.")

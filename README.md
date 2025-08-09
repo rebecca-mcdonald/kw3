@@ -1,21 +1,21 @@
-# Universal, Site‑Aware Question Map — v4
+# SERP‑powered Question Map — v5
 
-**Works with any website and any seed keywords** (no external APIs).  
-Pure‑Python dependencies only. Mini‑crawler extracts headings and top terms to contextualize question generation.
+### What’s new
+- **SERP expansion:** People Also Ask, Autocomplete, Related Searches (via SerpAPI).
+- **Optional LLM expansion:** supply `OPENAI_API_KEY` to add 25+ natural questions per seed.
+- **Site context:** mini-crawler extracts headings to inform prompts/fallbacks.
+- **Pure‑Python:** safe to deploy on Streamlit Cloud. `runtime.txt` pins Python 3.12.
 
-## Run locally
+### Setup
+1. Create environment/Streamlit secret `SERP_API_KEY` for SerpAPI (or paste in the sidebar).
+2. (Optional) Set `OPENAI_API_KEY` for LLM expansion.
+
+### Run
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deploy (Streamlit Cloud)
-- Push to GitHub.
-- `runtime.txt` pins to Python 3.12 for reliable wheels.
-- Create a new app pointing at `app.py`.
-
-## Why this fixes previous issues
-- No compiled dependencies (no scikit‑learn / scipy / numpy builds).
-- Robust guards to avoid KeyErrors and empty tables.
-- Universal question expansion that doesn’t rely on templates tied to a niche.
-- Site‑aware topics extracted from page titles/H1/H2/H3/meta to make questions relevant to *any* industry.
+### Notes
+- Volume/difficulty columns are labeled **proxy**. For real metrics, wire to your preferred keyword DB (e.g., DataForSEO Keywords Data) and map the returned `search_volume` into bands.
+- Provider abstraction is ready; add another `expand_with_serp` branch for a different API if you prefer.

@@ -1,4 +1,4 @@
-# Question Map — v7 (Universal + SERP + LLM + Coverage)
+# Question Map — v7.1 (No prefixing, SERP + LLM + Coverage)
 import base64, json, os, re
 from typing import List, Dict, Any, Tuple
 from urllib.parse import urljoin, urlparse
@@ -9,13 +9,12 @@ import streamlit as st
 import pandas as pd
 from pydantic import BaseModel
 
-APP_TITLE = "Question‑First Keyword Map (v7: SERP + LLM + Coverage)"
+APP_TITLE = "Question‑First Keyword Map (v7.1: SERP + LLM + Coverage, no prefixing)"
 DEFAULT_SEEDS = "pricing, installation, warranty, near me, comparison, troubleshooting"
 DEFAULT_MAX_PAGES = 12
 CRAWL_TIMEOUT = 10
 UA = "Mozilla/5.0 (compatible; QuestionMapBot/0.4; +https://example.com/bot)"
 
-# ---------- Utils ----------
 def df_to_csv_download(df: pd.DataFrame, filename: str) -> str:
     csv = df.to_csv(index=False).encode("utf-8")
     b64 = base64.b64encode(csv).decode()
@@ -39,7 +38,6 @@ def jaccard(a: set, b: set) -> float:
     union = len(a | b)
     return inter / union if union else 0.0
 
-# ---------- Inputs model ----------
 class AnalyzeRequest(BaseModel):
     project_url: str
     seeds: List[str]
@@ -50,7 +48,6 @@ class AnalyzeRequest(BaseModel):
     use_llm: bool = False
     openai_model: str = "gpt-4o-mini"
 
-# ---------- Crawl + index ----------
 def same_domain(url: str, base: str) -> bool:
     try:
         a = urlparse(url)
@@ -58,6 +55,9 @@ def same_domain(url: str, base: str) -> bool:
         return a.netloc.split(":")[0].lower() == b.netloc.split(":")[0].lower() or a.netloc == ""
     except Exception:
         return False
+
+CRAWL_TIMEOUT = 10
+UA = "Mozilla/5.0 (compatible; QuestionMapBot/0.4; +https://example.com/bot)"
 
 def fetch(url: str) -> str:
     try:
@@ -82,7 +82,7 @@ def extract_text_bits(html: str) -> Dict[str, List[str]]:
     bits["text"] = " ".join(ps)[:20000]
     return bits
 
-def crawl_site(start_url: str, max_pages: int = DEFAULT_MAX_PAGES) -> Tuple[List[str], List[Dict[str, List[str]]]]:
+def crawl_site(start_url: str, max_pages: int = DEFAULT_MAX_PAGES):
     seen = set()
     queue = [start_url]
     pages = []
@@ -153,7 +153,6 @@ def coverage_label(score: float) -> str:
     if score >= 0.40: return "Partial"
     return "No"
 
-# ---------- SERP (SerpAPI) ----------
 def serpapi_related(seed: str, api_key: str, location: str = "United States") -> Dict[str, List[str]]:
     out = {"paa": [], "related": [], "suggestions": []}
     try:
@@ -181,28 +180,22 @@ def serpapi_related(seed: str, api_key: str, location: str = "United States") ->
 def expand_with_serp(seed: str, provider: str, api_key: str | None, geography: str) -> List[str]:
     if provider == "serpapi" and api_key:
         data = serpapi_related(seed, api_key, "United States" if geography == "US" else geography)
+        # Keep strings as-is. No prefixing at all.
         bag = []
-        bag += [q if q.endswith("?") else f"{q}?" for q in data.get("paa", [])]
+        bag += [q if q.endswith("?") else q for q in data.get("paa", [])]
         bag += data.get("suggestions", [])
         bag += data.get("related", [])
-        norm = []
-        for q in bag:
-            q2 = q.strip()
-            if not q2: continue
-            if not q2.endswith("?") and not any(q2.lower().startswith(x) for x in ["what","how","why","when","where","who","does","can","is","are","should"]):
-                q2 = f"What about {q2}?"
-            norm.append(q2)
+        # Deduplicate (case-insensitive), keep original forms
         seen, out = set(), []
-        for q in norm:
-            if q.lower() not in seen:
+        for q in [clean_text(x) for x in bag if clean_text(x)]:
+            key = q.lower()
+            if key not in seen:
                 out.append(q)
-                seen.add(q.lower())
+                seen.add(key)
         return out[:60]
     return []
 
-# ---------- LLM Expansion (optional) ----------
 def llm_expand(seed: str, topics: List[str], model: str = "gpt-4o-mini") -> List[str]:
-    # Only run if OPENAI_API_KEY exists
     api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
     if not api_key:
         return []
@@ -210,10 +203,10 @@ def llm_expand(seed: str, topics: List[str], model: str = "gpt-4o-mini") -> List
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
         prompt = (
-            "Generate 25 searcher-style questions (short, natural US phrasing) about '{seed}'. "
-            "Blend commercial and informational intent. Prioritize high-impact topics users actually search. "
-            "Include cost/pricing, comparisons, near-me, how-to, troubleshooting. "
-            "Bias toward these site topics when relevant: " + ", ".join(topics[:10])
+            "Generate 25 US-searcher-style queries (short, natural) about '{seed}'. "
+            "Blend commercial & informational intent. Prefer phrases users actually type; avoid awkward prefixes. "
+            "Cover cost/pricing, comparisons, near-me, how-to, troubleshooting. "
+            "Bias towards these site topics when relevant: " + ", ".join(topics[:10])
         ).format(seed=seed)
         resp = client.chat.completions.create(
             model=model,
@@ -226,19 +219,18 @@ def llm_expand(seed: str, topics: List[str], model: str = "gpt-4o-mini") -> List
         out = []
         for ln in lines:
             ln = re.sub(r"^\d+[\).\s-]+", "", ln)
-            if not ln.endswith("?"):
-                ln = ln.rstrip(".") + "?"
-            out.append(ln)
+            out.append(ln)  # no forced '?'
+        # Dedup
         seen, uniq = set(), []
         for q in out:
-            if q.lower() not in seen:
+            k = q.lower()
+            if k not in seen:
                 uniq.append(q)
-                seen.add(q.lower())
+                seen.add(k)
         return uniq[:40]
     except Exception:
         return []
 
-# ---------- Scoring / Labels ----------
 def estimate_bands(question: str) -> tuple[str, str]:
     q = question.lower()
     if any(k in q for k in ["best", " vs", "price", "cost", "near me"]):
@@ -285,10 +277,9 @@ def compute_os(volume_band: str, difficulty_band: str, geography: str = "US", si
     oscore = 0.25*vol_w + 0.15*diff_w + 0.20*sitegap + 0.10*geo_w + 0.20*business_value + 0.10*serp_potential
     return round(float(oscore), 3)
 
-# ---------- UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("SERP (PAA/autocomplete/related) + optional LLM + on-site coverage (best URL + snippet). Pure-Python & deployable.")
+st.caption("SERP (PAA/autocomplete/related) + optional LLM + on-site coverage (best URL + snippet). No 'What about…' prefixing.")
 
 with st.sidebar:
     st.header("Inputs")
@@ -333,7 +324,6 @@ if run_btn:
         if req.use_llm:
             qset += llm_expand(seed, topics, model=req.openai_model)
         if not qset:
-            # fallback
             qset = [
                 f"What is {seed} and how does it work?",
                 f"How to choose {seed}?",
@@ -383,57 +373,9 @@ if run_btn:
     st.subheader("Questions + Coverage")
     st.dataframe(df.sort_values(["On‑Site Coverage","Opportunity Score"], ascending=[True, False]), use_container_width=True)
 
-    # Briefs / FAQ
-    st.subheader("Content Briefs (focus gaps)")
-    def build_brief(cluster_label: str, questions: List[str], page_type: str, url_slug: str) -> str:
-        h2 = [
-            "What it is / why it matters",
-            "Specs to compare / decision criteria",
-            "How to choose (use‑case)",
-            "Compliance / policies / warranties",
-            "Troubleshooting or implementation notes",
-            "Recommended products/services",
-            "FAQ",
-        ]
-        md = [
-            f"# Content Brief: {cluster_label}",
-            f"**Page Type:** {page_type}",
-            f"**Proposed URL:** {url_slug}",
-            "\n**Primary Questions**",
-        ]
-        md += [f"- {q}" for q in questions[:8]]
-        md += ["\n## Outline (H2/H3)"] + [f"- {x}" for x in h2]
-        md += ["\n## Internal Links\n- Category / services\n- Pricing / Contact / Quote\n- Shipping / Warranty / Policies"]
-        md += ["\n## CTA\n- Get a quote\n- Request a demo / consult"]
-        return "\n".join(md)
-
-    briefs = []
-    for label in sorted(df["Cluster Label"].unique()):
-        subset = df[(df["Cluster Label"] == label) & (df["On‑Site Coverage"] != "Yes")].sort_values("Opportunity Score", ascending=False)
-        top_qs = subset["Question"].tolist() or df[df["Cluster Label"] == label]["Question"].tolist()
-        page_type = subset["Recommended Page Type"].mode().iloc[0] if not subset.empty else df[df["Cluster Label"] == label]["Recommended Page Type"].mode().iloc[0]
-        slug_token = label.replace(" ", "-")
-        brief_md = build_brief(label, top_qs, page_type, f"/resources/{slug_token}-guide")
-        briefs.append((label, brief_md, top_qs[:6]))
-
-    for label, md, top_qs in briefs:
-        with st.expander(f"Brief: {label} — focus on gaps"):
-            st.markdown(md)
-            faq_entities = [{
-                "@type": "Question",
-                "name": q,
-                "acceptedAnswer": {"@type": "Answer", "text": "Short, helpful answer (90–160 words)."}
-            } for q in top_qs]
-            faq_json = {"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": faq_entities}
-            st.code(json.dumps(faq_json, indent=2), language="json")
-
-    # Export
     st.subheader("Export")
-    st.markdown(df_to_csv_download(df, "question_map_v7.csv"), unsafe_allow_html=True)
-    all_md = "\n\n".join([b[1] for b in briefs])
-    st.download_button("Download Briefs (Markdown)", data=all_md.encode("utf-8"), file_name="briefs.md", mime="text/markdown")
+    st.markdown(df_to_csv_download(df, "question_map_v7_1.csv"), unsafe_allow_html=True)
 
-    # Summary
     st.subheader("Summary")
     st.write({
         "Crawled pages": int(len(pages)),
@@ -444,4 +386,4 @@ if run_btn:
     })
 
 else:
-    st.info("Enter a site URL + seeds. Toggle SERP/LLM in the sidebar. The app crawls, generates questions, and checks on-site coverage with best-match URL + snippet.")
+    st.info("Enter a site URL + seeds. No prefixing of SERP strings. Toggle SERP/LLM in the sidebar. Coverage includes best-match URL + snippet.")

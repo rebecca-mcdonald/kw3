@@ -1,7 +1,7 @@
-# Question Map — v7.6 (Full features + diagnostics)
+# Question Map — v7.8 (Full features + URL canonicalization)
 import base64, json, os, re
 from typing import List, Dict, Any, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -9,12 +9,13 @@ import streamlit as st
 import pandas as pd
 from pydantic import BaseModel
 
-APP_TITLE = "Question‑First Keyword Map (v7.6: SERP + LLM + Coverage + Guides + Diagnostics)"
+APP_TITLE = "Question‑First Keyword Map (v7.8: SERP + LLM + Coverage + Guides + Diagnostics + Canonical Crawl)"
 DEFAULT_SEEDS = "pricing, installation, warranty, near me, comparison, troubleshooting"
 DEFAULT_MAX_PAGES = 60
 CRAWL_TIMEOUT = 15
-UA = "Mozilla/5.0 (compatible; QuestionMapBot/0.8; +https://example.com/bot)"
+UA = "Mozilla/5.0 (compatible; QuestionMapBot/1.0; +https://example.com/bot)"
 
+# ---------- Helpers ----------
 def df_to_csv_download(df: pd.DataFrame, filename: str) -> str:
     csv = df.to_csv(index=False).encode("utf-8")
     b64 = base64.b64encode(csv).decode()
@@ -37,23 +38,27 @@ def bigrams(toks: List[str]) -> List[str]:
 
 def jaccard(a: set, b: set) -> float:
     if not a or not b: return 0.0
-    inter = len(a & b)
-    union = len(a | b)
+    inter = len(a & b); union = len(a | b)
     return inter / union if union else 0.0
 
+# ---------- Config model ----------
 class AnalyzeRequest(BaseModel):
     project_url: str
     seeds: List[str]
     geography: str = "US"
     max_pages: int = DEFAULT_MAX_PAGES
-    serp_provider: str = "serpapi"
+    serp_provider: str = "serpapi"  # or "none"
     serp_api_key: str | None = None
     use_llm: bool = False
     openai_model: str = "gpt-4o-mini"
     crawl_scope: str = "Homepage + Blog"  # or "Whole site (same domain)"
     extra_roots: List[str] = []  # manual blog roots
+    drop_query_params: bool = True
+    treat_www_same: bool = True
+    normalize_trailing_slash: bool = True
 
-BLOG_HINTS = ("blog", "news", "insights", "articles", "learn", "resources", "guides", "knowledge", "academy")
+BLOG_HINTS = ("blog","news","insights","articles","learn","resources","guides","knowledge","academy")
+ASSET_EXTS = (".pdf",".jpg",".jpeg",".png",".gif",".webp",".svg",".css",".js",".json",".xml",".ico",".mp4",".mov",".zip",".rar",".7z",".mp3",".wav",".woff",".woff2",".ttf",".eot",".map")
 
 def path_matches_scope(path: str, scope: str, extra_roots: List[str]) -> bool:
     if scope == "Whole site (same domain)":
@@ -65,6 +70,39 @@ def path_matches_scope(path: str, scope: str, extra_roots: List[str]) -> bool:
         if r in (path + "/").lower():
             return True
     return any(f"/{hint}/" in (path + "/").lower() for hint in BLOG_HINTS)
+
+def is_asset(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        path = p.path.lower()
+        return any(path.endswith(ext) for ext in ASSET_EXTS)
+    except Exception:
+        return False
+
+def canonical_netloc(netloc: str, treat_www_same: bool) -> str:
+    if not netloc: return netloc
+    net = netloc.lower()
+    if treat_www_same and net.startswith("www."):
+        net = net[4:]
+    return net
+
+def normalize_path(path: str, normalize_trailing_slash: bool) -> str:
+    if not path or path == "":
+        return "/"
+    if normalize_trailing_slash and len(path) > 1 and path.endswith("/"):
+        return path[:-1]
+    return path
+
+def normalize_url(url: str, *, drop_query: bool, treat_www_same: bool, normalize_trailing_slash: bool) -> str:
+    p = urlparse(url)
+    scheme = (p.scheme or "https").lower()
+    netloc = canonical_netloc(p.netloc, treat_www_same)
+    path = normalize_path(p.path, normalize_trailing_slash)
+    # always strip fragment
+    fragment = ""
+    # optionally strip query
+    query = "" if drop_query else p.query
+    return urlunparse((scheme, netloc, path, p.params, query, fragment))
 
 def fetch(url: str) -> tuple[str, int, str]:
     try:
@@ -78,13 +116,12 @@ def fetch(url: str) -> tuple[str, int, str]:
 
 def extract_text_bits(html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "html.parser")
-    bits = {"title": "", "h": [], "meta_desc": "", "og_desc": "", "text": ""}
+    bits = {"title":"", "h":[], "meta_desc":"", "og_desc":"", "text":""}
     t = soup.find("title")
     if t and t.text: bits["title"] = clean_text(t.text)
     for tag in soup.find_all(["h1","h2","h3"]):
-        if tag.text and clean_text(tag.text):
-            bits["h"].append(clean_text(tag.text))
-    m = soup.find("meta", attrs={"name": "description"})
+        if tag.text and clean_text(tag.text): bits["h"].append(clean_text(tag.text))
+    m = soup.find("meta", attrs={"name":"description"})
     if m and m.get("content"): bits["meta_desc"] = clean_text(m["content"])
     og = soup.find("meta", property="og:description")
     if og and og.get("content"): bits["og_desc"] = clean_text(og["content"])
@@ -92,30 +129,50 @@ def extract_text_bits(html: str) -> Dict[str, Any]:
     bits["text"] = " ".join(ps)[:60000]
     return bits
 
-def crawl_site(start_url: str, max_pages: int, scope: str, extra_roots: List[str]):
+def crawl_site(start_url: str, max_pages: int, scope: str, extra_roots: List[str],
+               drop_query: bool, treat_www_same: bool, normalize_trailing_slash: bool):
     seen = set()
-    queue = [start_url]
+    start = normalize_url(start_url, drop_query=drop_query, treat_www_same=treat_www_same, normalize_trailing_slash=normalize_trailing_slash)
+    queue = [start]
     pages, bits_all, crawl_log = [], [], []
-    base_netloc = urlparse(start_url).netloc
+    base_netloc = canonical_netloc(urlparse(start_url).netloc, treat_www_same)
+
     while queue and len(pages) < max_pages:
         url = queue.pop(0)
         if url in seen: continue
         seen.add(url)
+
+        if is_asset(url):
+            crawl_log.append({"url": url, "skipped": "asset", "ok": False})
+            continue
+
         html, code, ctype = fetch(url)
         crawl_log.append({"url": url, "status": code, "content_type": ctype, "ok": bool(html)})
         if not html: continue
+
         pages.append(url)
         bits_all.append(extract_text_bits(html))
+
         soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
-            href = a["href"]
+            href = a["href"].strip()
+            if not href or href.startswith("#"):  # empty/fragment-only
+                continue
             next_url = urljoin(url, href)
-            u = urlparse(next_url)
-            if next_url.startswith(("mailto:", "tel:", "javascript:")): continue
-            if u.netloc and u.netloc != base_netloc: continue
-            if not path_matches_scope(u.path, scope, extra_roots): continue
-            if next_url not in seen and len(queue) < max_pages*4:
-                queue.append(next_url)
+            clean = normalize_url(next_url, drop_query=drop_query, treat_www_same=treat_www_same, normalize_trailing_slash=normalize_trailing_slash)
+            u = urlparse(clean)
+            if clean.startswith(("mailto:", "tel:", "javascript:")): 
+                continue
+            if canonical_netloc(u.netloc, treat_www_same) != base_netloc:
+                continue
+            if is_asset(clean):
+                crawl_log.append({"url": clean, "skipped": "asset", "ok": False})
+                continue
+            if not path_matches_scope(u.path, scope, extra_roots):
+                continue
+            if clean not in seen and len(queue) < max_pages*4:
+                queue.append(clean)
+
     return pages, bits_all, crawl_log
 
 def build_index(pages: List[str], bits_all: List[Dict[str, Any]]):
@@ -144,23 +201,7 @@ def text_contains_bigram(text: str, bigrams_list: List[str]) -> int:
     t = text.lower()
     return sum(1 for bg in bigrams_list if bg in t)
 
-def jaccard(a: set, b: set) -> float:
-    if not a or not b: return 0.0
-    inter = len(a & b)
-    union = len(a | b)
-    return inter / union if union else 0.0
-
-def norm_tokens(s: str) -> List[str]:
-    s = s.lower()
-    s = re.sub(r"[^a-z0-9\s\-]", " ", s)
-    toks = [t for t in re.split(r"\s+", s) if t]
-    toks = [t for t in toks if t not in STOP and not t.isdigit() and len(t) > 2]
-    return toks
-
 def best_page_match(question: str, index: List[Dict[str, Any]]):
-    def bigrams(toks: List[str]) -> List[str]:
-        return [f"{toks[i]} {toks[i+1]}" for i in range(len(toks)-1)] if len(toks) > 1 else []
-
     q_norm = clean_text(question).lower().rstrip("?")
     q_tokens = set(norm_tokens(q_norm)) or set(re.findall(r"[a-z0-9]+", q_norm))
     q_bigrams = bigrams(list(q_tokens))
@@ -193,7 +234,6 @@ def best_page_match(question: str, index: List[Dict[str, Any]]):
             0.06*bg_norm
         )
 
-        # snippet
         snippet = ""
         if exact_title: snippet = doc["title"]
         elif exact_head: snippet = doc["headings"][:220]
@@ -223,6 +263,7 @@ def coverage_label(score: float) -> str:
     if score >= 0.33: return "Partial"
     return "No"
 
+# ---------- SERP / LLM ----------
 def serpapi_related(seed: str, api_key: str, location: str = "United States") -> Dict[str, List[str]]:
     out = {"paa": [], "related": [], "suggestions": []}
     try:
@@ -297,6 +338,7 @@ def llm_expand(seed: str, topics: List[str], model: str = "gpt-4o-mini") -> List
     except Exception:
         return []
 
+# ---------- Scoring + Labels ----------
 def estimate_bands(question: str) -> tuple[str, str]:
     q = question.lower()
     if any(k in q for k in ["best", " vs", "price", "cost", "near me"]):
@@ -343,9 +385,10 @@ def compute_os(volume_band: str, difficulty_band: str, geography: str = "US", si
     oscore = 0.25*vol_w + 0.15*diff_w + 0.20*sitegap + 0.10*geo_w + 0.20*business_value + 0.10*serp_potential
     return round(float(oscore), 3)
 
+# ---------- UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Full feature pack + diagnostics: coverage that actually fills, guides, and visibility into crawl/indexing.")
+st.caption("Canonical crawl: strips #fragment, optional ?query, unifies www/non‑www, normalizes slashes, skips assets. Full features + diagnostics.")
 
 with st.sidebar:
     st.header("Inputs")
@@ -354,6 +397,9 @@ with st.sidebar:
     geography = st.selectbox("Target geography", ["US", "CA", "Global"], index=0)
     crawl_scope = st.selectbox("Crawl scope", ["Homepage + Blog", "Whole site (same domain)"], index=0)
     extra_roots_text = st.text_input("Extra blog roots (comma-separated, e.g. knowledge, academy)")
+    drop_query = st.toggle("Strip ?query parameters", value=True, help="Keeps one canonical URL per page. Turn off if the site relies on query params for unique pages.")
+    treat_www_same = st.toggle("Treat www and non‑www as the same", value=True, help="Unifies lbclightingpro.com and www.lbclightingpro.com")
+    normalize_slash = st.toggle("Normalize trailing slash", value=True, help="Dedupes /page and /page/")
     max_pages = st.number_input("Max pages to crawl (cap)", min_value=5, max_value=200, value=DEFAULT_MAX_PAGES, step=1)
     st.divider()
     st.subheader("SERP Expansion")
@@ -373,22 +419,26 @@ if run_btn:
     serp_key = api_key or os.environ.get("SERP_API_KEY") or st.secrets.get("SERP_API_KEY", None)
     req = AnalyzeRequest(project_url=url or "https://example.com", seeds=seeds, geography=geography,
                          max_pages=int(max_pages), serp_provider=provider, serp_api_key=serp_key,
-                         use_llm=use_llm, openai_model=llm_model, crawl_scope=crawl_scope, extra_roots=extra_roots)
+                         use_llm=use_llm, openai_model=llm_model, crawl_scope=crawl_scope, extra_roots=extra_roots,
+                         drop_query_params=drop_query, treat_www_same=treat_www_same, normalize_trailing_slash=normalize_slash)
 
     # Crawl + index + diagnostics
     with st.status("Crawling and indexing…", expanded=True):
-        pages, bits_all, crawl_log = crawl_site(req.project_url, max_pages=req.max_pages, scope=req.crawl_scope, extra_roots=req.extra_roots)
+        pages, bits_all, crawl_log = crawl_site(req.project_url, max_pages=req.max_pages, scope=req.crawl_scope,
+                                                extra_roots=req.extra_roots, drop_query=req.drop_query_params,
+                                                treat_www_same=req.treat_www_same, normalize_trailing_slash=req.normalize_trailing_slash)
         index = build_index(pages, bits_all) if pages else []
         st.write(f"Crawled pages: {len(pages)} / Cap: {req.max_pages}")
-        bad = [row for row in crawl_log if not row["ok"]]
-        if bad:
-            st.warning(f"{len(bad)} pages returned non-HTML or error; they were skipped.")
+        skipped_assets = sum(1 for r in crawl_log if r.get("skipped") == "asset")
+        non_html = sum(1 for r in crawl_log if r.get("ok") is False and "status" in r)
+        if skipped_assets or non_html:
+            st.warning(f"Skipped {skipped_assets} asset URLs and {non_html} non‑HTML/error responses.")
         if pages:
-            st.write("Sample URLs:", pages[:8])
+            st.write("Sample URLs (canonical):", pages[:8])
 
     if not index:
         st.error("No crawlable HTML pages were indexed.")
-        st.info("Try: (1) ensure URL includes https://, (2) switch scope to 'Whole site', (3) add custom blog roots, (4) increase Max pages.")
+        st.info("Try: (1) ensure URL includes https://, (2) switch scope to 'Whole site', (3) add custom blog roots, (4) increase Max pages, (5) toggle query stripping OFF if needed.")
         st.stop()
 
     # Build questions
@@ -450,7 +500,7 @@ if run_btn:
     st.subheader("Questions + Coverage")
     st.dataframe(df.sort_values(["On‑Site Coverage","Opportunity Score"], ascending=[True, False]), use_container_width=True)
 
-    # Coverage diagnostics (token counts)
+    # Diagnostics
     st.subheader("Coverage diagnostics")
     diag = []
     for row in index:
@@ -464,7 +514,7 @@ if run_btn:
         })
     st.dataframe(pd.DataFrame(diag), use_container_width=True)
 
-    # Content Guides (per cluster, focus on gaps)
+    # Content Guides
     st.subheader("Content Guides (auto-briefs per cluster, focus on gaps)")
     def build_brief(cluster_label: str, questions: List[str], page_type: str, url_slug: str) -> str:
         h2 = [
@@ -510,9 +560,7 @@ if run_btn:
 
     # Export
     st.subheader("Export")
-    st.markdown(df_to_csv_download(df, "question_map_v7_6.csv"), unsafe_allow_html=True)
-    all_md = "\n\n".join([b[1] for b in briefs]) if briefs else ""
-    st.download_button("Download Content Guides (Markdown)", data=all_md.encode("utf-8"), file_name="content_guides_v7_6.md", mime="text/markdown")
+    st.markdown(df_to_csv_download(df, "question_map_v7_8.csv"), unsafe_allow_html=True)
 
 else:
-    st.info("Paste a site URL + seeds. v7.6 merges targeted crawl, strong matching, diagnostics, and Content Guides.")
+    st.info("Paste a site URL + seeds. v7.8 strips #fragments, optional ?query, unifies www/non‑www, normalizes trailing slashes, skips assets — plus full features.")
